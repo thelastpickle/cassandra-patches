@@ -1,0 +1,162 @@
+From 0209e598e13961d11fe533f978102696db6d49c5 Mon Sep 17 00:00:00 2001
+From: Jon Haddad <jon@jonhaddad.com>
+Date: Thu, 27 Oct 2016 09:44:44 -0700
+Subject: [PATCH] backported CASSANDRA-10718, printing pending tasks by table
+
+---
+ .../db/compaction/AbstractCompactionTask.java      |  4 +-
+ .../cassandra/metrics/CompactionMetrics.java       | 52 ++++++++++++++++++++++
+ src/java/org/apache/cassandra/tools/NodeProbe.java |  1 +
+ .../cassandra/tools/nodetool/CompactionStats.java  | 25 ++++++++++-
+ 4 files changed, 79 insertions(+), 3 deletions(-)
+
+diff --git a/src/java/org/apache/cassandra/db/compaction/AbstractCompactionTask.java b/src/java/org/apache/cassandra/db/compaction/AbstractCompactionTask.java
+index cfc4071..953a77b 100644
+--- a/src/java/org/apache/cassandra/db/compaction/AbstractCompactionTask.java
++++ b/src/java/org/apache/cassandra/db/compaction/AbstractCompactionTask.java
+@@ -60,8 +60,8 @@ public abstract class AbstractCompactionTask extends WrappedRunnable
+             String name = tmp.substring(pos + 1);
+             filenames.append(name + ", ");
+         }
+-        abstract_logger.info("Compaction task type created for {}: {} ",
+-                                cfs.getColumnFamilyName(), filenames);
++        abstract_logger.info("Compaction task {} created for {}: {} ",
++                              cfs.getColumnFamilyName(), filenames);
+         // end of YX-39 patch
+ 
+     }
+diff --git a/src/java/org/apache/cassandra/metrics/CompactionMetrics.java b/src/java/org/apache/cassandra/metrics/CompactionMetrics.java
+index eb00728..139105e 100644
+--- a/src/java/org/apache/cassandra/metrics/CompactionMetrics.java
++++ b/src/java/org/apache/cassandra/metrics/CompactionMetrics.java
+@@ -24,6 +24,7 @@ import com.codahale.metrics.Counter;
+ import com.codahale.metrics.Gauge;
+ import com.codahale.metrics.Meter;
+ 
++import org.apache.cassandra.config.CFMetaData;
+ import org.apache.cassandra.config.Schema;
+ import org.apache.cassandra.db.ColumnFamilyStore;
+ import org.apache.cassandra.db.Keyspace;
+@@ -44,6 +45,9 @@ public class CompactionMetrics implements CompactionManager.CompactionExecutorSt
+ 
+     /** Estimated number of compactions remaining to perform */
+     public final Gauge<Integer> pendingTasks;
++    /** Estimated number of compactions remaining to perform, group by keyspace and then table name */
++    public final Gauge<Map<String, Map<String, Integer>>> pendingTasksByTableName;
++
+     /** Number of completed compactions since server [re]start */
+     public final Gauge<Long> completedTasks;
+     /** Total number of compactions since server [re]start */
+@@ -68,6 +72,54 @@ public class CompactionMetrics implements CompactionManager.CompactionExecutorSt
+                 return n + compactions.size();
+             }
+         });
++
++        pendingTasksByTableName = Metrics.register(factory.createMetricName("PendingTasksByTableName"),
++            new Gauge<Map<String, Map<String, Integer>>>()
++        {
++            @Override
++            public Map<String, Map<String, Integer>> getValue() {
++                Map<String, Map<String, Integer>> resultMap = new HashMap<String, Map<String,Integer>>();
++                // estimation of compactions need to be done
++                for (String keyspaceName : Schema.instance.getKeyspaces())
++                {
++                    for (ColumnFamilyStore cfs : Keyspace.open(keyspaceName).getColumnFamilyStores())
++                    {
++                        int taskNumber = cfs.getCompactionStrategy().getEstimatedRemainingTasks();
++                        if (taskNumber > 0)
++                        {
++                            if (!resultMap.containsKey(keyspaceName))
++                            {
++                                resultMap.put(keyspaceName, new HashMap<String, Integer>());
++                            }
++                            resultMap.get(keyspaceName).put(cfs.getColumnFamilyName(), taskNumber);
++                        }
++                    }
++                }
++
++                // currently running compactions
++                for (CompactionInfo.Holder compaction : compactions)
++                {
++                    CFMetaData metaData = compaction.getCompactionInfo().getCFMetaData();
++                    if (!resultMap.containsKey(metaData.ksName))
++                    {
++                        resultMap.put(metaData.ksName, new HashMap<String, Integer>());
++                    }
++
++                    Map<String, Integer> tableNameToCountMap = resultMap.get(metaData.ksName);
++                    if (tableNameToCountMap.containsKey(metaData.cfName))
++                    {
++                        tableNameToCountMap.put(metaData.cfName,
++                                                tableNameToCountMap.get(metaData.cfName) + 1);
++                    }
++                    else
++                    {
++                        tableNameToCountMap.put(metaData.cfName, 1);
++                    }
++                }
++                return resultMap;
++            }
++        });
++
+         completedTasks = Metrics.register(factory.createMetricName("CompletedTasks"), new Gauge<Long>()
+         {
+             public Long getValue()
+diff --git a/src/java/org/apache/cassandra/tools/NodeProbe.java b/src/java/org/apache/cassandra/tools/NodeProbe.java
+index 24c5874..a25d0f7 100644
+--- a/src/java/org/apache/cassandra/tools/NodeProbe.java
++++ b/src/java/org/apache/cassandra/tools/NodeProbe.java
+@@ -1188,6 +1188,7 @@ public class NodeProbe implements AutoCloseable
+                             CassandraMetricsRegistry.JmxCounterMBean.class);
+                 case "CompletedTasks":
+                 case "PendingTasks":
++                case "PendingTasksByTableName":
+                     return JMX.newMBeanProxy(mbeanServerConn,
+                             new ObjectName("org.apache.cassandra.metrics:type=Compaction,name=" + metricName),
+                             CassandraMetricsRegistry.JmxGaugeMBean.class).getValue();
+diff --git a/src/java/org/apache/cassandra/tools/nodetool/CompactionStats.java b/src/java/org/apache/cassandra/tools/nodetool/CompactionStats.java
+index e57d2ee..7a3714d 100644
+--- a/src/java/org/apache/cassandra/tools/nodetool/CompactionStats.java
++++ b/src/java/org/apache/cassandra/tools/nodetool/CompactionStats.java
+@@ -25,6 +25,7 @@ import java.text.DecimalFormat;
+ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Map.Entry;
+ 
+ import org.apache.cassandra.db.compaction.CompactionManagerMBean;
+ import org.apache.cassandra.db.compaction.OperationType;
+@@ -45,7 +46,29 @@ public class CompactionStats extends NodeToolCmd
+     public void execute(NodeProbe probe)
+     {
+         CompactionManagerMBean cm = probe.getCompactionManagerProxy();
+-        System.out.println("pending tasks: " + probe.getCompactionMetric("PendingTasks"));
++        Map<String, Map<String, Integer>> pendingTaskNumberByTable =
++            (Map<String, Map<String, Integer>>) probe.getCompactionMetric("PendingTasksByTableName");
++        int numTotalPendingTask = 0;
++        System.out.println("pending tasks: ");
++        for (Entry<String, Map<String, Integer>> ksEntry : pendingTaskNumberByTable.entrySet()) {
++            String ksName = ksEntry.getKey();
++            for (Entry<String, Integer> tableEntry : ksEntry.getValue().entrySet()) {
++                String tableName = tableEntry.getKey();
++                int pendingTaskCount = tableEntry.getValue();
++
++                StringBuilder builder = new StringBuilder();
++                builder.append("- ");
++                builder.append(ksName);
++                builder.append('.');
++                builder.append(tableName);
++                builder.append(": ");
++                builder.append(pendingTaskCount);
++                System.out.println(builder.toString());
++                numTotalPendingTask += pendingTaskCount;
++            }
++        }
++        System.out.println("total number: " + numTotalPendingTask);
++
+         long remainingBytes = 0;
+         List<Map<String, String>> compactions = cm.getCompactions();
+         if (!compactions.isEmpty())
+-- 
+2.9.2
+
