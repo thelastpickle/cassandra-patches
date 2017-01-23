@@ -1,0 +1,121 @@
+From 8e1609f25a0e2ae56e21d6c814d1eb6881db65de Mon Sep 17 00:00:00 2001
+From: Jon Haddad <jon@jonhaddad.com>
+Date: Tue, 10 Jan 2017 22:32:34 -0800
+Subject: [PATCH] backported CASSANDRA-13015
+
+---
+ .../cassandra/db/compaction/CompactionManager.java       | 16 ++++++++++++++++
+ .../apache/cassandra/db/compaction/CompactionTask.java   | 13 +++++++++++++
+ .../org/apache/cassandra/metrics/CompactionMetrics.java  | 15 +++++++++++++++
+ 3 files changed, 44 insertions(+)
+
+diff --git a/src/java/org/apache/cassandra/db/compaction/CompactionManager.java b/src/java/org/apache/cassandra/db/compaction/CompactionManager.java
+index 8a3c11e..9813043 100644
+--- a/src/java/org/apache/cassandra/db/compaction/CompactionManager.java
++++ b/src/java/org/apache/cassandra/db/compaction/CompactionManager.java
+@@ -1561,6 +1561,22 @@ public class CompactionManager implements CompactionManagerMBean
+         void finishCompaction(CompactionInfo.Holder ci);
+     }
+ 
++    public void incrementAborted()
++    {
++        metrics.compactionsAborted.inc();
++    }
++
++    public void incrementCompactionsReduced()
++    {
++        metrics.compactionsReduced.inc();
++    }
++
++    public void incrementSstablesDropppedFromCompactions(long num)
++    {
++        metrics.sstablesDropppedFromCompactions.inc(num);
++    }
++
++
+     public List<Map<String, String>> getCompactions()
+     {
+         List<Holder> compactionHolders = CompactionMetrics.getCompactions();
+diff --git a/src/java/org/apache/cassandra/db/compaction/CompactionTask.java b/src/java/org/apache/cassandra/db/compaction/CompactionTask.java
+index 7489b3d..f0f6e22 100644
+--- a/src/java/org/apache/cassandra/db/compaction/CompactionTask.java
++++ b/src/java/org/apache/cassandra/db/compaction/CompactionTask.java
+@@ -29,6 +29,7 @@ import java.util.concurrent.TimeUnit;
+ import com.google.common.base.Predicate;
+ import com.google.common.collect.Iterables;
+ import com.google.common.collect.Sets;
++import com.google.common.util.concurrent.RateLimiter;
+ 
+ import org.apache.cassandra.db.compaction.writers.CompactionAwareWriter;
+ import org.apache.cassandra.db.compaction.writers.DefaultCompactionWriter;
+@@ -281,22 +282,34 @@ public class CompactionTask extends AbstractCompactionTask
+     {
+         AbstractCompactionStrategy strategy = cfs.getCompactionStrategy();
+ 
++        int sstablesRemoved = 0;
+         while(true)
+         {
+             long expectedWriteSize = cfs.getExpectedCompactedFileSize(transaction.originals(), compactionType);
+             long estimatedSSTables = Math.max(1, expectedWriteSize / strategy.getMaxSSTableBytes());
+ 
+             if(cfs.directories.hasAvailableDiskSpace(estimatedSSTables, expectedWriteSize))
++            {
++                if(sstablesRemoved > 0)
++                {
++                    CompactionManager.instance.incrementCompactionsReduced();
++                    CompactionManager.instance.incrementSstablesDropppedFromCompactions(sstablesRemoved);
++                }
++
+                 break;
++            }
+ 
+             if (!reduceScopeForLimitedSpace(expectedWriteSize))
+             {
+                 // we end up here if we can't take any more sstables out of the compaction.
+                 // usually means we've run out of disk space
+                 String msg = String.format("Not enough space for compaction, estimated sstables = %d, expected write size = %d", estimatedSSTables, expectedWriteSize);
++
+                 logger.warn(msg);
++                CompactionManager.instance.incrementAborted();
+                 throw new RuntimeException(msg);
+             }
++            sstablesRemoved++;
+             logger.warn("Not enough space for compaction, {}MB estimated.  Reducing scope.",
+                             (float) expectedWriteSize / 1024 / 1024);
+         }
+diff --git a/src/java/org/apache/cassandra/metrics/CompactionMetrics.java b/src/java/org/apache/cassandra/metrics/CompactionMetrics.java
+index eb00728..5ae94b0 100644
+--- a/src/java/org/apache/cassandra/metrics/CompactionMetrics.java
++++ b/src/java/org/apache/cassandra/metrics/CompactionMetrics.java
+@@ -51,6 +51,16 @@ public class CompactionMetrics implements CompactionManager.CompactionExecutorSt
+     /** Total number of bytes compacted since server [re]start */
+     public final Counter bytesCompacted;
+ 
++
++    /** Total number of compactions that have had sstables drop out of them */
++    public final Counter compactionsReduced;
++
++    /** Total number of sstables that have been dropped out */
++    public final Counter sstablesDropppedFromCompactions;
++
++    /** Total number of compactions which have outright failed due to lack of disk space */
++    public final Counter compactionsAborted;
++
+     public CompactionMetrics(final ThreadPoolExecutor... collectors)
+     {
+         pendingTasks = Metrics.register(factory.createMetricName("PendingTasks"), new Gauge<Integer>()
+@@ -80,6 +90,11 @@ public class CompactionMetrics implements CompactionManager.CompactionExecutorSt
+         });
+         totalCompactionsCompleted = Metrics.meter(factory.createMetricName("TotalCompactionsCompleted"));
+         bytesCompacted = Metrics.counter(factory.createMetricName("BytesCompacted"));
++
++        // compaction failure metrics
++        compactionsReduced = Metrics.counter(factory.createMetricName("CompactionsReduced"));
++        sstablesDropppedFromCompactions = Metrics.counter(factory.createMetricName("SSTablesDroppedFromCompaction"));
++        compactionsAborted = Metrics.counter(factory.createMetricName("CompactionsAborted"));
+     }
+ 
+     public void beginCompaction(CompactionInfo.Holder ci)
+-- 
+2.9.2
+
